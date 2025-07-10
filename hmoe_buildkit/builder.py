@@ -43,7 +43,7 @@ class HMOEBuilder:
                 attn_implementation='flash_attention_2',
                 device_map=0
             ) 
-            if (self.vlm_idx > -1) and (idx!=self.vlm_idx)
+            if ((self.vlm_idx == -1) or (idx != self.vlm_idx))
             else AutoModelForVision2Seq.from_pretrained(
                 model_name,
                 trust_remote_code=True,
@@ -99,7 +99,7 @@ class HMOEBuilder:
     def split_modules(all_causallms, vlm_idx):
         all_embed_tokens = [
             copy.deepcopy(causallm.model.embed_tokens)
-            if (vlm_idx > -1) and (idx!=vlm_idx)
+            if ((vlm_idx == -1) or (idx != vlm_idx))
             else copy.deepcopy(causallm.model.text_model.embed_tokens)
             for idx, causallm in enumerate(all_causallms)
         ]
@@ -110,7 +110,7 @@ class HMOEBuilder:
 
         all_models = [
             copy.deepcopy(causallm.model)
-            if (vlm_idx > -1) and (idx!=vlm_idx)
+            if ((vlm_idx == -1) or (idx != vlm_idx))
             else copy.deepcopy(causallm.model.text_model)
             for idx, causallm in enumerate(all_causallms)
         ]

@@ -1,4 +1,3 @@
-import os
 import copy
 import torch
 from typing import List
@@ -8,80 +7,60 @@ from transformers import (
     AutoModelForCausalLM,
     AutoModelForVision2Seq,
 )
-from .model import HMOE, HMOEConfig, register
-
-
-register()
+from .modeling_hmoe import HMOE, HMOEConfig
 
 
 class HMOEBuilder:
-
     def __init__(
         self,
         model_names: List[str],
         experts_per_seq: int,
-        torch_dtype: str = "bfloat16",
-        attn_implementation: str = "flash_attention_2",
-        trust_remote_code: bool = True,
+        torch_dtype: str = 'bfloat16',
+        router_aux_loss_coef: float = 1e-2,
     ):
-
         self.model_names = model_names
         self.experts_per_seq = experts_per_seq
         self.torch_dtype = torch_dtype
-        self.attn_implementation = attn_implementation
-        self.trust_remote_code = trust_remote_code
+        self.router_aux_loss_coef = router_aux_loss_coef
 
         self.all_tokenizers = [
-            AutoTokenizer.from_pretrained(
-                name, 
-                use_fast=True, 
-                trust_remote_code=self.trust_remote_code
-            )
+            AutoTokenizer.from_pretrained(name, use_fast=True, trust_remote_code=True)
             for name in model_names
         ]
 
-        is_vlms = [self.is_vlm(name) for name in self.model_names]
-        assert sum(is_vlms) <= 1, "At most 1 VLM can be used to build a HMOE"
-        self.vlm_idx = is_vlms.index(True) if True in is_vlms else -1
+        is_vlms = [self.is_vlm(name) for name in model_names]
+        if sum(is_vlms) > 1:
+            raise ValueError("At most one VLM can be used to build an HMOE.")
+        self.vlm_idx = is_vlms.index(True) if any(is_vlms) else -1
 
-        common_args = dict(
+        common = dict(
             torch_dtype=self.torch_dtype,
-            attn_implementation=self.attn_implementation,
-            trust_remote_code=self.trust_remote_code,
+            trust_remote_code=True,
         )
         self.all_causallms = [
-            AutoModelForVision2Seq.from_pretrained(
-                name,
-                **common_args
-            ) 
+            AutoModelForVision2Seq.from_pretrained(name, **common)
             if self.vlm_idx == idx
-            else AutoModelForCausalLM.from_pretrained(
-                name,
-                **common_args
-            )
-            for idx, name in enumerate(self.model_names)
+            else AutoModelForCausalLM.from_pretrained(name, **common)
+            for idx, name in enumerate(model_names)
         ]
-
 
     @staticmethod
     def is_vlm(name: str) -> bool:
         try:
-            proc = AutoProcessor.from_pretrained(name)
+            proc = AutoProcessor.from_pretrained(name, trust_remote_code=True)
             return (
                 hasattr(proc, "tokenizer")
-                and hasattr(proc, "image_processor") or hasattr(proc, "feature_extractor")
+                and (hasattr(proc, "image_processor") or hasattr(proc, "feature_extractor"))
             )
         except Exception:
             return False
 
-
-    def mix_tokenizers(self):
-
+    def mix_tokenizers(self) -> AutoTokenizer | AutoProcessor:
         if self.vlm_idx >= 0:
             base = copy.deepcopy(self.all_tokenizers[self.vlm_idx])
             processor = AutoProcessor.from_pretrained(
                 self.model_names[self.vlm_idx],
-                trust_remote_code=self.trust_remote_code,
+                trust_remote_code=True,
                 use_fast=True,
             )
             processor.tokenizer = base
@@ -89,93 +68,59 @@ class HMOEBuilder:
             base = copy.deepcopy(self.all_tokenizers[0])
             processor = base
 
-        all_tokens = {t for tok in self.all_tokenizers for t in tok.get_vocab()}
+        all_tokens = {tok for tokz in self.all_tokenizers for tok in tokz.get_vocab()}
         new_tokens = list(all_tokens - set(base.get_vocab()))
         if new_tokens:
             base.add_tokens(new_tokens)
 
-        # specials = {}
-        # for tok in self.all_tokenizers:
-        #     for k, v in tok.special_tokens_map.items():
-        #         if v not in base.all_special_tokens:
-        #             specials.setdefault(k, v)
-        # if specials:
-        #     base.add_special_tokens(specials)
-
         return processor
-
-    
-    def split_modules(self):
-
-        experts = [
-            copy.deepcopy(m.model.text_model)
-            if self.vlm_idx==idx
-            else copy.deepcopy(m.model)
-            for idx, m in enumerate(self.all_causallms)
-        ]
-        for m in experts:
-            del m.embed_tokens
-
-        if self.vlm_idx >= 0:
-            hidden_size = self.all_causallms[self.vlm_idx].config.text_config.hidden_size
-            vision_config = self.all_causallms[self.vlm_idx].config.vision_config.to_dict()
-            vision_encoder = copy.deepcopy(self.all_causallms[self.vlm_idx].model) if self.vlm_idx >= 0 else None
-            del vision_encoder.text_model
-        else:
-            hidden_size = self.all_causallms[0].config.hidden_size
-            vision_config = None
-            vision_encoder = None
-
-        return experts, hidden_size, vision_config, vision_encoder
-
 
     @staticmethod
     def _average_weights(src_embs, tgt_emb, vocabs, processor):
-        vocab = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+        tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
         with torch.no_grad():
-            for tok, tid in vocab.get_vocab().items():
+            for tok, tid in tokenizer.get_vocab().items():
                 accum = torch.zeros_like(tgt_emb.weight[tid])
                 cnt = 0
                 for v, emb in zip(vocabs, src_embs):
                     if tok in v:
                         sid = v[tok]
-                        d = min(emb.weight.size(1), accum.size(0))
-                        accum[:d] += emb.weight[sid][:d].to(accum)
+                        d = min(emb.weight.size(1), accum.numel())
+                        accum[:d] += emb.weight[sid][:d].to(accum.device, non_blocking=True)
                         cnt += 1
                 if cnt:
                     tgt_emb.weight[tid] = accum / cnt
-
+        return tgt_emb
 
     def build(self):
-
         tokenizer = self.mix_tokenizers()
 
-        experts, hidden_size, vision_config, vision_encoder = self.split_modules()
-
         config = HMOEConfig(
-            vocab_size=len(tokenizer.tokenizer if self.vlm_idx >= 0 else tokenizer),
-            hidden_size=hidden_size,
-            num_experts=len(experts),
+            model_names=self.model_names,
             experts_per_seq=self.experts_per_seq,
-            vision_config=vision_config,
+            vocab_size=len(tokenizer.tokenizer if self.vlm_idx >= 0 else tokenizer),
             torch_dtype=self.torch_dtype,
-            attn_implementation=self.attn_implementation,
+            router_aux_loss_coef=self.router_aux_loss_coef
         )
-        model = HMOE(config, experts, vision_encoder=vision_encoder)
 
-        self._average_weights(
-            [m.get_input_embeddings() for m in self.all_causallms],
-            model.embed_tokens,
-            [t.get_vocab() for t in self.all_tokenizers],
-            tokenizer,
+        model = HMOE(config)
+
+        model.set_input_embeddings(
+            self._average_weights(
+                [m.get_input_embeddings() for m in self.all_causallms],
+                model.get_input_embeddings(),
+                [t.get_vocab() for t in self.all_tokenizers],
+                tokenizer,
+            )
         )
-        self._average_weights(
-            [m.get_output_embeddings() for m in self.all_causallms],
-            model.lm_head,
-            [t.get_vocab() for t in self.all_tokenizers],
-            tokenizer,
+        model.set_output_embeddings(
+            self._average_weights(
+                [m.get_output_embeddings() for m in self.all_causallms],
+                model.get_output_embeddings(),
+                [t.get_vocab() for t in self.all_tokenizers],
+                tokenizer,
+            )
         )
 
         del self.all_tokenizers, self.all_causallms
-
         return tokenizer, model

@@ -20,7 +20,7 @@ def fineweben_pretraining():
     dataset = load_dataset('HuggingFaceFW/fineweb', name="sample-10BT", split="train", streaming=True)
     columns = dataset.column_names
     columns.remove('text')
-    dataset = dataset.map(lambda example: {'text' : ' '.join(example['text'].split()[:10])}, remove_columns=columns)
+    dataset = dataset.map(lambda example: {'text' : ' '.join(example['text'].split()[:512])}, remove_columns=columns)
     return dataset
 
     

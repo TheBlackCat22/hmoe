@@ -16,7 +16,7 @@ class HMOEBuilder:
         model_names: List[str],
         experts_per_seq: int,
         torch_dtype: str = 'bfloat16',
-        router_aux_loss_coef: float = 1e-2,
+        router_aux_loss_coef: float = 1e-3,
     ):
         self.model_names = model_names
         self.experts_per_seq = experts_per_seq

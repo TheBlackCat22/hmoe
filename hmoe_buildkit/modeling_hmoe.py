@@ -22,7 +22,7 @@ class HMOEConfig(PretrainedConfig):
         experts_per_seq: int = None,
         vocab_size: int = None,
         torch_dtype: str = 'bfloat16',
-        router_aux_loss_coef: float = 1e-2,
+        router_aux_loss_coef: float = 1e-3,
         **kwargs,
     ):
         if model_names is not None:
@@ -65,6 +65,7 @@ class HMOEConfig(PretrainedConfig):
 class Expert(nn.Module):
     def __init__(self, hidden_size: int, model: nn.Module):
         super().__init__()
+        self.gradient_checkpointing = False
         self.in_proj = (
             nn.Linear(hidden_size, model.config.hidden_size, bias=False, dtype=model.dtype)
             if hidden_size != model.config.hidden_size
@@ -77,31 +78,40 @@ class Expert(nn.Module):
             else None
         )
 
-    def forward(self, inputs_embeds, attention_mask=None, **unused):
+        self._disable_model_gradient_checkpointing()
+
+    def _disable_model_gradient_checkpointing(self):
+        if hasattr(self.model, 'gradient_checkpointing_disable'):
+            self.model.gradient_checkpointing_disable()
+        if hasattr(self.model, 'gradient_checkpointing'):
+            self.model.gradient_checkpointing = False
+        for module in self.model.modules():
+            if hasattr(module, 'gradient_checkpointing'):
+                module.gradient_checkpointing = False
+    
+    def _forward_impl(self, inputs_embeds, attention_mask=None):
         if self.in_proj is not None:
             inputs_embeds = self.in_proj(inputs_embeds)
-
-        if getattr(self, "gradient_checkpointing", False) and self.training:
-            def create_custom_forward(module):
-                def custom_forward(*inputs):
-                    return module(*inputs).last_hidden_state
-                return custom_forward
-
-            hidden_states = torch.utils.checkpoint.checkpoint(
-                create_custom_forward(self.model),
+        
+        hidden_states = self.model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+        ).last_hidden_state
+        
+        if self.out_proj is not None:
+            hidden_states = self.out_proj(hidden_states)
+        return hidden_states
+    
+    def forward(self, inputs_embeds, attention_mask=None, **unused):
+        if self.gradient_checkpointing and self.training:
+            return torch.utils.checkpoint.checkpoint(
+                self._forward_impl,
                 inputs_embeds,
                 attention_mask,
                 use_reentrant=False,
             )
         else:
-            hidden_states = self.model(
-                inputs_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-            ).last_hidden_state
-
-        if self.out_proj is not None:
-            hidden_states = self.out_proj(hidden_states)
-        return hidden_states
+            return self._forward_impl(inputs_embeds, attention_mask)
 
 
 class HMOE(PreTrainedModel, GenerationMixin):
@@ -115,6 +125,7 @@ class HMOE(PreTrainedModel, GenerationMixin):
 
         self.config = config
 
+        self.gradient_checkpointing = False
         expert_models, vision_encoder = self._build_experts_and_vision()
         self.vision_encoder = vision_encoder
 
@@ -195,13 +206,19 @@ class HMOE(PreTrainedModel, GenerationMixin):
         return
 
     def _set_gradient_checkpointing(self, module, value=False):
-        if hasattr(module, "gradient_checkpointing"):
-            module.gradient_checkpointing = value
-        for child in module.children():
-            self._set_gradient_checkpointing(child, value)
+        if isinstance(module, (HMOE, Expert)):
+            if hasattr(module, "gradient_checkpointing"):
+                module.gradient_checkpointing = value
+        if not hasattr(module, 'model') or isinstance(module, Expert):
+            for name, child in module.named_children():
+                if isinstance(module, Expert) and name == 'model':
+                    continue
+                self._set_gradient_checkpointing(child, value)
 
     def gradient_checkpointing_enable(self, **kwargs):
         self._set_gradient_checkpointing(self, value=True)
+        for expert in self.experts:
+            expert._disable_model_gradient_checkpointing()
 
     def gradient_checkpointing_disable(self):
         self._set_gradient_checkpointing(self, value=False)
@@ -249,16 +266,7 @@ class HMOE(PreTrainedModel, GenerationMixin):
     def _reorder_cache(self, past_key_values, beam_idx):
         return tuple()
 
-    def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        pixel_values: Optional[torch.FloatTensor] = None,
-        pixel_attention_mask: Optional[torch.Tensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
-        **kwargs,
-    ):
+    def _forward_embedding_and_vision(self, input_ids, pixel_values=None, pixel_attention_mask=None):
         inputs_embeds = self.embed_tokens(input_ids)
 
         if pixel_values is not None and self.vision_encoder is not None:
@@ -270,7 +278,9 @@ class HMOE(PreTrainedModel, GenerationMixin):
                 inputs_embeds=inputs_embeds,
                 image_hidden_states=image_states,
             )
+        return inputs_embeds
 
+    def _forward_routing_and_experts(self, inputs_embeds, attention_mask):
         if attention_mask is not None:
             pooled = (inputs_embeds * attention_mask.unsqueeze(-1)).sum(1) / attention_mask.sum(1, keepdim=True)
         else:
@@ -305,6 +315,43 @@ class HMOE(PreTrainedModel, GenerationMixin):
             batch_pos = batch_range[mask] // K
             final_hidden.index_add_(0, batch_pos, out)
 
+        return final_hidden, aux_loss
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        pixel_attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
+        **kwargs,
+    ):
+        if self.gradient_checkpointing and self.training:
+            inputs_embeds = torch.utils.checkpoint.checkpoint(
+                self._forward_embedding_and_vision,
+                input_ids,
+                pixel_values,
+                pixel_attention_mask,
+                use_reentrant=False,
+            )
+        else:
+            inputs_embeds = self._forward_embedding_and_vision(
+                input_ids, pixel_values, pixel_attention_mask
+            )
+        
+        if self.gradient_checkpointing and self.training:
+            final_hidden, aux_loss = torch.utils.checkpoint.checkpoint(
+                self._forward_routing_and_experts,
+                inputs_embeds,
+                attention_mask,
+                use_reentrant=False,
+            )
+        else:
+            final_hidden, aux_loss = self._forward_routing_and_experts(
+                inputs_embeds, attention_mask
+            )
+        
         logits = self.lm_head(final_hidden)
 
         loss = None

@@ -1,4 +1,3 @@
-import hmoe_buildkit
 from datasets import load_dataset
 from accelerate import Accelerator
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -17,7 +16,7 @@ def print_on_main(text):
 
 
 def fineweben_pretraining():
-    dataset = load_dataset('HuggingFaceFW/fineweb', name="sample-10BT", split="train", streaming=True)
+    dataset = load_dataset('HuggingFaceFW/fineweb', data_dir="sample/10BT", split="train", streaming=True)
     columns = dataset.column_names
     columns.remove('text')
     dataset = dataset.map(lambda example: {'text' : ' '.join(example['text'].split()[:512])}, remove_columns=columns)

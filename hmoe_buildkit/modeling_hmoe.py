@@ -228,15 +228,14 @@ class HMOE(PreTrainedModel, GenerationMixin):
         probs = F.softmax(logits, dim=-1)
         return logits, probs
 
-    def _topk_routing(self, probs):
+    def _topk_routing(self, logits):
         K = self.config.experts_per_seq
         if self.training:
-            noise = -torch.empty_like(probs).exponential_().log()
-            vals, idx = torch.topk(probs + noise, K)
-        else:
-            vals, idx = torch.topk(probs, K)
-        vals = vals / vals.sum(dim=-1, keepdim=True)
-        return vals, idx
+            noise = -torch.empty_like(logits).exponential_().log()
+            logits = logits + noise
+        vals, idx = torch.topk(logits, K, dim=-1)
+        weights = torch.softmax(vals, dim=-1)
+        return weights, idx
 
     def _load_balancing_loss(self, router_probs, expert_indices):
         E = self.config.num_experts
@@ -287,7 +286,7 @@ class HMOE(PreTrainedModel, GenerationMixin):
             pooled = inputs_embeds.mean(1)
 
         router_logits, router_probs = self._compute_router_probs(pooled)
-        routing_weights, expert_indices = self._topk_routing(router_probs)
+        routing_weights, expert_indices = self._topk_routing(router_logits)
         aux_loss = self._load_balancing_loss(router_probs, expert_indices)
 
         B, S, H = inputs_embeds.size()
